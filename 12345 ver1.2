@@ -1,0 +1,170 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+
+#define DHTPIN 4       // GPIO 4
+#define DHTTYPE DHT11  // DHT11
+
+const char *ssid = "Smart Home";
+WebServer server(80);
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---- Stable reading cache ----
+float cachedT = NAN;
+float cachedH = NAN;
+unsigned long lastRead = 0;
+const unsigned long READ_INTERVAL = 2500; // DHT11 needs ~2s between reads
+
+// Web Interface stored in Flash memory (PROGMEM)
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Climate Monitor</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    html,body{height:100%;width:100%;overflow:hidden;background:#000;}
+    body{
+      background:#000;
+      color:#33ff33;
+      font-family:'Courier New',Courier,monospace;
+      display:flex;justify-content:center;align-items:center;
+      text-shadow:0 0 6px #33ff33, 0 0 14px #1a8c1a;
+      position:relative;
+    }
+    body::before{
+      content:'';position:fixed;inset:0;pointer-events:none;z-index:10;
+      background:radial-gradient(ellipse at center, rgba(0,0,0,0) 40%, rgba(0,0,0,0.55) 75%, rgba(0,0,0,0.95) 100%);
+      box-shadow:inset 0 0 120px 40px #000, inset 0 0 40px 10px rgba(0,0,0,0.9);
+    }
+    body::after{
+      content:'';position:fixed;inset:0;pointer-events:none;z-index:9;
+      background:repeating-linear-gradient(to bottom, rgba(0,255,0,0.03) 0px, rgba(0,255,0,0.03) 1px, transparent 1px, transparent 3px);
+    }
+    .screen{
+      width:100%;height:100%;
+      display:flex;flex-direction:column;
+      justify-content:center;align-items:center;
+      padding:8vh 6vw;text-align:left;
+    }
+    .line{
+      font-size:clamp(18px,5vw,40px);
+      letter-spacing:2px;
+      margin:3vh 0;
+      width:100%;max-width:900px;
+      display:flex;flex-direction:column;
+    }
+    .label{color:#22cc22;font-size:0.55em;letter-spacing:6px;margin-bottom:1vh;}
+    .value{color:#66ff66;text-shadow:0 0 8px #33ff33, 0 0 20px #1a8c1a;}
+    .err{color:#ff3333;text-shadow:0 0 8px #ff0000, 0 0 20px #8c0000;}
+    .unit{font-size:0.7em;opacity:0.85;margin-left:6px;}
+  </style>
+</head>
+<body>
+  <div class="screen">
+    <div class="line">
+      <span class="label">TEMPERATURE</span>
+      <span id="temp" class="value">--.-<span class="unit">&deg;C</span></span>
+    </div>
+    <div class="line">
+      <span class="label">HUMIDITY</span>
+      <span id="hum" class="value">--.-<span class="unit">%</span></span>
+    </div>
+  </div>
+
+  <script>
+    function updateData() {
+      fetch('/data')
+        .then(response => response.json())
+        .then(data => {
+          const tempEl = document.getElementById('temp');
+          const humEl = document.getElementById('hum');
+
+          if (data.error) {
+            tempEl.className = 'err';
+            tempEl.innerHTML = 'NO DATA';
+            humEl.className = 'err';
+            humEl.innerHTML = 'NO DATA';
+          } else {
+            tempEl.className = 'value';
+            tempEl.innerHTML = data.temp + '<span class="unit">&deg;C</span>';
+            humEl.className = 'value';
+            humEl.innerHTML = data.hum + '<span class="unit">%</span>';
+          }
+        })
+        .catch(() => {
+          document.getElementById('temp').className = 'err';
+          document.getElementById('temp').innerHTML = 'OFFLINE';
+          document.getElementById('hum').className = 'err';
+          document.getElementById('hum').innerHTML = 'OFFLINE';
+        });
+    }
+
+    setInterval(updateData, 2500);
+    updateData();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void updateSensor() {
+  unsigned long now = millis();
+  if (now - lastRead < READ_INTERVAL) return;
+  lastRead = now;
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  // Retry once on failure
+  if (isnan(h) || isnan(t)) {
+    delay(50);
+    h = dht.readHumidity();
+    t = dht.readTemperature();
+  }
+
+  if (!isnan(h) && !isnan(t)) {
+    cachedH = h;
+    cachedT = t;
+  }
+}
+
+void handleRoot() {
+  server.send_P(200, "text/html", INDEX_HTML);
+}
+
+void handleData() {
+  updateSensor();
+
+  String json;
+  if (isnan(cachedT) || isnan(cachedH)) {
+    json = "{\"error\":true}";
+  } else {
+    json = "{\"temp\":\"" + String(cachedT, 1) + "\",\"hum\":\"" + String(cachedH, 1) + "\"}";
+  }
+
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  dht.begin();
+  
+  WiFi.softAP(ssid);
+  IPAddress IP = WiFi.softAPIP();
+
+  Serial.println("\n--- WiFi Access Point Started ---");
+  Serial.print("IP Address: ");
+  Serial.println(IP);
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  updateSensor();
+}
